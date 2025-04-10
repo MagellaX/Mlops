@@ -1,0 +1,96 @@
+name: Full MLOps Pipeline
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  mlops-pipeline:
+    runs-on: ubuntu-latest
+
+    env:
+      PROJECT_NAME: linear_regression_model
+      PYTHON_VERSION: '3.10'
+      IMAGE_NAME: devopsdoor5/linear_regression_model
+      GCP_SSH_USER: your-gcp-username
+      GCP_SERVER_IP: your.gcp.server.ip
+      GCP_KEY: ${{ secrets.GCP_SSH_KEY }} # Add your private SSH key as a secret
+
+    steps:
+
+    # Step 1: Checkout the code
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    # Step 2: Checkout the DVC-tracked data from GCS
+    - name: Setup DVC and Checkout Data
+      run: |
+        sudo apt update && sudo apt install -y python3-pip
+        pip3 install dvc[gcs]
+        dvc pull
+
+    # Step 3: Create Python Virtual Env
+    - name: Create Python Virtual Environment
+      run: |
+        python3 -m venv venv
+        source venv/bin/activate
+
+    # Step 4: Install all modules
+    - name: Install Dependencies
+      run: |
+        source venv/bin/activate
+        pip install --upgrade pip
+        pip install -r requirements.txt
+
+    # Step 5: Run the main program
+    - name: Run the Program
+      run: |
+        source venv/bin/activate
+        python main.py
+
+    # Step 6: Get the Run ID (simulate with timestamp or UUID)
+    - name: Capture Run ID
+      run: |
+        echo "RUN_ID=$(date +%s)" >> $GITHUB_ENV
+
+    # Step 7: Deploy the model locally (e.g., FastAPI)
+    - name: Deploy Locally
+      run: |
+        nohup python deploy.py &
+
+    # Step 8: Test the model locally
+    - name: Test Local Model
+      run: |
+        sleep 5  # Give the server time to start
+        curl http://localhost:8000/ping
+
+    # Step 9: Build Docker Image
+    - name: Build Docker Image
+      run: |
+        docker build -t $IMAGE_NAME:${{ env.RUN_ID }} .
+
+    # Step 10: Push Docker Image to Docker Hub
+    - name: Push Docker Image
+      env:
+        DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      run: |
+        echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+        docker push $IMAGE_NAME:${{ env.RUN_ID }}
+
+    # Step 11: Deploy to GCP via SSH + Docker
+    - name: Remote Deploy to GCP
+      uses: appleboy/ssh-action@v0.1.10
+      with:
+        host: ${{ env.GCP_SERVER_IP }}
+        username: ${{ env.GCP_SSH_USER }}
+        key: ${{ env.GCP_KEY }}
+        script: |
+          docker pull $IMAGE_NAME:${{ env.RUN_ID }}
+          docker stop ml-service || true && docker rm ml-service || true
+          docker run -d --name ml-service -p 80:8000 $IMAGE_NAME:${{ env.RUN_ID }}
+
+    # Step 12: Test the deployed app on GCP
+    - name: Test Remote Model
+      run: |
+        curl http://${{ env.GCP_SERVER_IP }}/ping

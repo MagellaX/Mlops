@@ -1,0 +1,120 @@
+name: ML Model CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  mlflow-pipeline:
+    runs-on: ubuntu-latest
+    environment: PROD
+
+    env:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      REMOTE_HOST: ${{ secrets.REMOTE_HOST }}
+      REMOTE_USER: ${{ secrets.REMOTE_USER }}
+      IMAGE_NAME: linear_regression_model:latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Authenticate with Google Cloud
+      run: |
+        echo "${{ secrets.GCP_SA_KEY }}" | base64 -d > ${HOME}/gcp-key.json
+        export GOOGLE_APPLICATION_CREDENTIALS="${HOME}/gcp-key.json"
+        gcloud auth activate-service-account --key-file=${HOME}/gcp-key.json
+        gcloud config set project ferrous-wonder-449913-u3
+
+    - name: Install DVC and Pull Data from GCS
+      run: |
+        pip install dvc[gcs] dvc_gs
+        dvc remote add -d gcs-remote gs://mlops-data-tracking/linear-regression-model
+        export GOOGLE_APPLICATION_CREDENTIALS="${HOME}/gcp-key.json"
+        dvc pull
+
+    - name: Set up Virtual Environment
+      run: |
+        python3 -m venv venv
+        source venv/bin/activate
+        echo "VIRTUAL ENV CREATED"
+
+    - name: Install Python Dependencies
+      run: |
+        source venv/bin/activate
+        pip install numpy pandas matplotlib scikit-learn mlflow # Add your module list
+
+    - name: Run Training Script
+      run: |
+        source venv/bin/activate
+        python app/simple_ml_mlflow_csv.py
+
+    - name: Extract latest Run ID from mlruns
+      id: get_run_id
+      run: |
+        # Find all run folders across all experiments and sort by modification time
+        RUN_ID=$(find ./mlruns/*/* -maxdepth 0 -type d -printf '%T@ %p\n' | sort -n | tail -1 | awk '{print $2}' | xargs -n 1 basename)
+        
+        echo "Latest Run ID: $RUN_ID"
+        echo "RUN_ID=$RUN_ID" >> $GITHUB_ENV
+
+    - name: Serve Model Locally
+      run: |
+        # Activate virtualenv
+        source venv/bin/activate
+
+        # Check if mlflow is available
+        which mlflow || { echo "MLflow is not installed or not in PATH" >&2; exit 1; }
+
+        # Serve the model in the background and log output
+        mlflow models serve -m runs:/$RUN_ID/linear_regression_model -p 5000 --no-conda > mlflow_server.log 2>&1 &
+
+        echo "MLflow model serving started on port 5000. Logs are in mlflow_server.log. Thanks"
+
+    - name: Wait for Model to be Ready
+      run: sleep 10
+
+    - name: Test Local Model
+      run: |
+        source venv/bin/activate
+        python app/test_model_api_local.py
+
+    - name: Build Docker Image
+      run: |
+        source venv/bin/activate
+        mlflow models build-docker -m runs:/$RUN_ID/linear_regression_model -n $IMAGE_NAME
+
+    - name: Push to Docker Hub
+      run: |
+        echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+        docker tag $IMAGE_NAME $DOCKER_USERNAME/$IMAGE_NAME
+        docker push $DOCKER_USERNAME/$IMAGE_NAME
+
+    - name: Setup SSH Key for Remote Access
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H ${{ secrets.REMOTE_HOST }} >> ~/.ssh/known_hosts
+
+    - name: Deploy to Remote Server via SSH
+      run: |
+        ssh ${{ secrets.REMOTE_USER }}@${{ secrets.REMOTE_HOST }} "
+          docker pull $DOCKER_USERNAME/$IMAGE_NAME &&
+          docker stop ml_model || true &&
+          docker rm ml_model || true &&
+          docker run -d --name ml_model -p 80:5000 $DOCKER_USERNAME/$IMAGE_NAME
+        "
+
+    - name: Test Remote Model
+      run: |
+        source venv/bin/activate
+        python app/test_model_api_prod.py
